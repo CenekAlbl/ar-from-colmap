@@ -1,0 +1,6 @@
+[submodule "python-tools"]
+	path = python-tools
+	url = https://github.com/CenekAlbl/python-tools
+[submodule "pythontools"]
+	path = pythontools
+	url = https://github.com/CenekAlbl/pythontools
