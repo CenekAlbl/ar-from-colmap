@@ -16,10 +16,17 @@ from pythontools.utils import ransac as ransac
 from pythontools.geometry import utils as ut
 from pythontools.geometry import rotation as rot
 
-# the following functions are taken from COLMAP python scripts
+# the following functions are taken from COLMAP python scripts, Author: Johannes L. Schoenberger (jsch-at-demuc-dot-de)
 
 Point3D = collections.namedtuple(
     "Point3D", ["id", "xyz", "rgb", "error", "image_ids", "point2D_idxs"])
+
+BaseImage = collections.namedtuple(
+    "Image", ["id", "qvec", "tvec", "camera_id", "name", "xys", "point3D_ids"])
+
+class Image(BaseImage):
+    def qvec2rotmat(self):
+        return qvec2rotmat(self.qvec)
 
 def image_ids_to_pair_id(image_id1, image_id2):
     if image_id1 > image_id2:
@@ -31,6 +38,18 @@ def pair_id_to_image_ids(pair_id):
     image_id2 = pair_id % 2147483647
     image_id1 = (pair_id - image_id2) / 2147483647
     return image_id1, image_id2
+
+def qvec2rotmat(qvec):
+    return np.array([
+        [1 - 2 * qvec[2]**2 - 2 * qvec[3]**2,
+         2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
+         2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2]],
+        [2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
+         1 - 2 * qvec[1]**2 - 2 * qvec[3]**2,
+         2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1]],
+        [2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
+         2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
+         1 - 2 * qvec[1]**2 - 2 * qvec[2]**2]])
 
 def read_points3d_binary(path_to_model_file):
     """
@@ -72,17 +91,56 @@ def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
     data = fid.read(num_bytes)
     return struct.unpack(endian_character + format_char_sequence, data)
 
+def read_images_binary(path_to_model_file):
+    """
+    see: src/base/reconstruction.cc
+        void Reconstruction::ReadImagesBinary(const std::string& path)
+        void Reconstruction::WriteImagesBinary(const std::string& path)
+    """
+    images = {}
+    with open(path_to_model_file, "rb") as fid:
+        num_reg_images = read_next_bytes(fid, 8, "Q")[0]
+        for image_index in range(num_reg_images):
+            binary_image_properties = read_next_bytes(
+                fid, num_bytes=64, format_char_sequence="idddddddi")
+            image_id = binary_image_properties[0]
+            qvec = np.array(binary_image_properties[1:5])
+            tvec = np.array(binary_image_properties[5:8])
+            camera_id = binary_image_properties[8]
+            image_name = ""
+            current_char = read_next_bytes(fid, 1, "c")[0]
+            while current_char != b"\x00":   # look for the ASCII 0 entry
+                image_name += current_char.decode("utf-8")
+                current_char = read_next_bytes(fid, 1, "c")[0]
+            num_points2D = read_next_bytes(fid, num_bytes=8,
+                                           format_char_sequence="Q")[0]
+            x_y_id_s = read_next_bytes(fid, num_bytes=24*num_points2D,
+                                       format_char_sequence="ddq"*num_points2D)
+            xys = np.column_stack([tuple(map(float, x_y_id_s[0::3])),
+                                   tuple(map(float, x_y_id_s[1::3]))])
+            point3D_ids = np.array(tuple(map(int, x_y_id_s[2::3])))
+            images[image_id] = Image(
+                id=image_id, qvec=qvec, tvec=tvec,
+                camera_id=camera_id, name=image_name,
+                xys=xys, point3D_ids=point3D_ids)
+    return images
+
+# END of COLMAP scripts
+
 # here we define the workspace
 # the folder containing the exported COLMAP result
-datadir = ''
+datadir = '/home/alblc/cloud/Rolling-Shutter/real_experiments/seq01/gs/'
 # COLMAP database file, such that the absolute path is datadir+datafile
-datafile = 'database.db'
+datafile = 'gs.db'
 # colmap exported 3D points
 pointsfile = 'points3D.bin'
+# do you want to also extract the original camera poses?
+extract_poses = 1
+imagesfile = 'images.bin'
 # the directory which contains the images we want to register to the COLMAP model
-ar_images_dir = '/home/alblc/cloud/Rolling-Shutter/real_experiments/outdoor_ar/take3/'
+ar_images_dir = '/home/alblc/cloud/Rolling-Shutter/real_experiments/seq01/gs/'
 # output directory
-out_dir = 'output/'
+out_dir = 'ar_output/'
 try:  
     os.makedirs(out_dir)
 except OSError:  
@@ -105,6 +163,15 @@ for row in res.fetchall():
     descriptors.append(np.frombuffer(row[3], dtype=np.uint8))
     ndesc += int(descriptors[-1].shape[0]/128)
 print("Found %d images and %d keypoints total, average %d keypoints per image" % (len(descriptors),ndesc,int(ndesc/len(descriptors))))
+if extract_poses:
+    P = []
+    print("Reading camera poses...")
+    images = read_images_binary(datadir + imagesfile)
+    for i in images:
+        R = images[i].qvec2rotmat()
+        t = images[i].tvec.reshape(3,1)
+        P.append(np.hstack((R,t)))
+
 print("Reading 3D points...")
 points3d = read_points3d_binary(datadir + pointsfile)
 print("Processing the input data...")
@@ -177,5 +244,8 @@ for file in tqdm.tqdm(files_rs):
         corr3D.append(xyznp[idxs3D,:])
     else:
         skipped += 1
-np.savez(out_dir + "output", corr2D=corr2D,corr3D=corr3D)
+if extract_poses:
+    np.savez(out_dir + "output", corr2D=corr2D,corr3D=corr3D,P=P)
+else:
+    np.savez(out_dir + "output", corr2D=corr2D,corr3D=corr3D)
 print("Done! Saved to %s/output.npz. No correspondences for %d images" % (out_dir,skipped))
